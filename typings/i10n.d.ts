@@ -3,8 +3,12 @@
 /* eslint-disable */
 // @ts-nocheck
 export type FluentMessageId =
+  | 'reader-figures-empty'
+  | 'reader-figures-error'
   | 'reader-figures-head-text'
+  | 'reader-figures-loading'
   | 'reader-figures-refresh-button-tooltip'
+  | 'reader-figures-sequence-warning'
   | 'reader-figures-sidenav-tooltip'
   | 'startup-begin'
   | 'startup-finish';
