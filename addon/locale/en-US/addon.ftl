@@ -7,3 +7,7 @@ reader-figures-sequence-warning = Possible missing captions: {$labels}
 reader-figures-helper-partial = Precise navigation is enabled for {$matched}/{$total} figures. The rest are using caption fallback.
 reader-figures-helper-no-python = No usable Python environment was found. Using caption-based navigation.
 reader-figures-helper-fallback = Precise navigation is temporarily unavailable. Using caption-based navigation.
+reader-figures-preview-title = {$label} Preview
+reader-figures-preview-loading = Rendering figure preview...
+reader-figures-preview-error = Could not open this figure preview.
+reader-figures-preview-close = Close preview

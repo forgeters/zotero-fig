@@ -7,3 +7,7 @@ reader-figures-sequence-warning = 可能漏检：{$labels}
 reader-figures-helper-partial = 已启用精确定位，{$matched}/{$total} 个 Figure 使用 bbox，其余回退标题定位。
 reader-figures-helper-no-python = 未检测到可用的 Python 环境，当前使用标题定位。
 reader-figures-helper-fallback = 精确定位暂时不可用，当前使用标题定位。
+reader-figures-preview-title = {$label} 预览
+reader-figures-preview-loading = 正在生成图表预览...
+reader-figures-preview-error = 无法打开图表预览。
+reader-figures-preview-close = 关闭预览

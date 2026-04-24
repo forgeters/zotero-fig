@@ -32,6 +32,21 @@ type PDFViewerContext = {
   doc?: Document;
 };
 
+interface ReaderFigurePreviewState {
+  context: PDFViewerContext;
+  doc: Document;
+  scrollContainer: HTMLElement;
+  pageEntries: Map<number, FigureEntry[]>;
+  clickListener: (event: MouseEvent) => void;
+  mouseMoveListener: (event: MouseEvent) => void;
+  keydownListener: (event: KeyboardEvent) => void;
+}
+
+interface FigurePreviewRenderState {
+  context: PDFViewerContext;
+  doc: Document;
+}
+
 interface FigurePanelRenderProps {
   body: HTMLDivElement;
   item: Zotero.Item;
@@ -42,8 +57,16 @@ const PANE_ID = "zoterofig-reader-figures";
 const MAX_CAPTION_LENGTH = 220;
 const CJK_NUMERAL_CHARS = "零〇一二两三四五六七八九十百千万";
 const CJK_NUMBER_PATTERN = `[0-9０-９${CJK_NUMERAL_CHARS}]+`;
+const PREVIEW_OVERLAY_ID = "zoterofig-figure-preview-overlay";
+const PREVIEW_PANEL_ID = "zoterofig-figure-preview-panel";
+const PREVIEW_CURSOR = "zoom-in";
 
 let registered = false;
+const readerPreviewStates = new WeakMap<
+  _ZoteroTypes.ReaderInstance,
+  ReaderFigurePreviewState
+>();
+const activeReaderPreviewStates = new Set<ReaderFigurePreviewState>();
 
 export function registerReaderFigurePanel() {
   if (registered) {
@@ -91,6 +114,7 @@ export function unregisterReaderFigurePanel() {
     return;
   }
 
+  teardownAllReaderFigurePreviews();
   Zotero.ItemPaneManager.unregisterSection(PANE_ID);
   registered = false;
 }
@@ -122,6 +146,7 @@ async function scanAndRenderInternal(
       },
     );
     props.setSectionSummary(`${result.entries.length}`);
+    await updateReaderFigurePreview(props.item, result.entries);
     renderFigureList(props.body, props.item, result);
   } catch (error) {
     ztoolkit.log("Failed to scan PDF captions", error);
@@ -150,6 +175,70 @@ async function scanPDFCaptions(
   ]);
 
   return mergeFigureScanResults(legacyResult, helperResult);
+}
+
+async function updateReaderFigurePreview(
+  item: Zotero.Item,
+  entries: FigureEntry[],
+) {
+  const reader = await getReaderForItem(item);
+  if (!reader || reader.type !== "pdf") {
+    return;
+  }
+
+  const context = await getPDFViewerContext(reader);
+  const doc = context?.doc;
+  const scrollContainer = context && getPDFScrollContainer(context);
+  const pageEntries = groupPreviewEntriesByPage(entries);
+  const existingState = readerPreviewStates.get(reader);
+
+  if (!context || !doc || !scrollContainer || pageEntries.size === 0) {
+    if (existingState) {
+      teardownReaderFigurePreview(existingState);
+      readerPreviewStates.delete(reader);
+    }
+    return;
+  }
+
+  if (
+    existingState &&
+    existingState.doc === doc &&
+    existingState.scrollContainer === scrollContainer
+  ) {
+    existingState.context = context;
+    existingState.pageEntries = pageEntries;
+    return;
+  }
+
+  if (existingState) {
+    teardownReaderFigurePreview(existingState);
+  }
+
+  const state: ReaderFigurePreviewState = {
+    context,
+    doc,
+    scrollContainer,
+    pageEntries,
+    clickListener: (event) => {
+      void handleReaderFigureClick(reader, state, event);
+    },
+    mouseMoveListener: (event) => {
+      updateReaderFigureHover(state, event);
+    },
+    keydownListener: (event) => {
+      if (event.key === "Escape") {
+        closeReaderFigurePreview(state.doc);
+      }
+    },
+  };
+
+  scrollContainer.addEventListener("click", state.clickListener, true);
+  scrollContainer.addEventListener("mousemove", state.mouseMoveListener, {
+    passive: true,
+  });
+  doc.defaultView?.addEventListener("keydown", state.keydownListener);
+  readerPreviewStates.set(reader, state);
+  activeReaderPreviewStates.add(state);
 }
 
 async function scanPDFCaptionsLegacy(
@@ -260,6 +349,36 @@ function getPDFItemForReader(
   }
 
   return item;
+}
+
+function groupPreviewEntriesByPage(entries: FigureEntry[]) {
+  const groupedEntries = new Map<number, FigureEntry[]>();
+  for (const entry of entries) {
+    if (!entry.navigation?.targetBBoxNormalized) {
+      continue;
+    }
+
+    const pageEntries = groupedEntries.get(entry.pageIndex) || [];
+    pageEntries.push(entry);
+    groupedEntries.set(entry.pageIndex, pageEntries);
+  }
+
+  for (const pageEntries of groupedEntries.values()) {
+    pageEntries.sort((leftEntry, rightEntry) => {
+      return getBBoxArea(leftEntry) - getBBoxArea(rightEntry);
+    });
+  }
+
+  return groupedEntries;
+}
+
+function getBBoxArea(entry: FigureEntry) {
+  const bbox = entry.navigation?.targetBBoxNormalized;
+  if (!bbox) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  return Math.max(0, bbox[2] - bbox[0]) * Math.max(0, bbox[3] - bbox[1]);
 }
 
 function getPDFPageCount(context: PDFViewerContext) {
@@ -1293,6 +1412,14 @@ function createFigureCard(
   card.addEventListener("click", () => {
     void navigateToFigure(entry, item);
   });
+  card.addEventListener("contextmenu", (event) => {
+    if (!supportsFigurePreview(entry)) {
+      return;
+    }
+
+    event.preventDefault();
+    void openFigurePreviewFromSidebar(entry, item);
+  });
   card.addEventListener("keydown", (event) => {
     const keyboardEvent = event as KeyboardEvent;
     if (keyboardEvent.key !== "Enter" && keyboardEvent.key !== " ") {
@@ -1315,6 +1442,38 @@ async function navigateToFigure(entry: FigureEntry, item: Zotero.Item) {
 
   await reader.navigate({ pageIndex: entry.pageIndex });
   await scrollToFigureTarget(reader, entry);
+}
+
+async function openFigurePreviewFromSidebar(
+  entry: FigureEntry,
+  item: Zotero.Item,
+) {
+  if (!supportsFigurePreview(entry)) {
+    return;
+  }
+
+  const reader = await getReaderForItem(item);
+  if (!reader || reader.type !== "pdf") {
+    return;
+  }
+
+  const existingState = readerPreviewStates.get(reader);
+  if (existingState) {
+    await openReaderFigurePreview(reader, existingState, entry);
+    return;
+  }
+
+  const context = await getPDFViewerContext(reader);
+  const doc = context?.doc;
+  if (!context || !doc) {
+    return;
+  }
+
+  await openReaderFigurePreview(reader, { context, doc }, entry);
+}
+
+function supportsFigurePreview(entry: FigureEntry) {
+  return Boolean(entry.navigation?.targetBBoxNormalized);
 }
 
 async function getReaderForItem(item: Zotero.Item) {
@@ -1495,4 +1654,559 @@ function getPDFScrollContainer(
     getHTMLElement(context.app.pdfViewer?.container) ??
     getHTMLElement(context.doc?.querySelector("#viewerContainer"))
   );
+}
+
+function teardownAllReaderFigurePreviews() {
+  for (const state of activeReaderPreviewStates) {
+    teardownReaderFigurePreview(state);
+  }
+  activeReaderPreviewStates.clear();
+}
+
+function teardownReaderFigurePreview(state: ReaderFigurePreviewState) {
+  state.scrollContainer.removeEventListener("click", state.clickListener, true);
+  state.scrollContainer.removeEventListener(
+    "mousemove",
+    state.mouseMoveListener,
+  );
+  state.doc.defaultView?.removeEventListener("keydown", state.keydownListener);
+  state.scrollContainer.style.cursor = "";
+  closeReaderFigurePreview(state.doc);
+  activeReaderPreviewStates.delete(state);
+}
+
+async function handleReaderFigureClick(
+  reader: _ZoteroTypes.ReaderInstance,
+  state: ReaderFigurePreviewState,
+  event: MouseEvent,
+) {
+  if (
+    event.button !== 0 ||
+    event.defaultPrevented ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.shiftKey
+  ) {
+    return;
+  }
+
+  const selection = state.doc.defaultView?.getSelection?.();
+  if (selection && !selection.isCollapsed) {
+    return;
+  }
+
+  const match = findFigureEntryAtEventTarget(state, event);
+  if (!match) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+  await openReaderFigurePreview(reader, state, match);
+}
+
+function updateReaderFigureHover(
+  state: ReaderFigurePreviewState,
+  event: MouseEvent,
+) {
+  if (event.buttons !== 0) {
+    return;
+  }
+
+  const match = findFigureEntryAtEventTarget(state, event);
+  state.scrollContainer.style.cursor = match ? PREVIEW_CURSOR : "";
+}
+
+function findFigureEntryAtEventTarget(
+  state: ReaderFigurePreviewState,
+  event: MouseEvent,
+) {
+  const ElementCtor = state.doc.defaultView?.Element;
+  const target = event.target;
+  if (!ElementCtor || !(target instanceof ElementCtor)) {
+    return undefined;
+  }
+  const targetElement = target as Element;
+
+  const previewPanel = state.doc.getElementById(PREVIEW_PANEL_ID);
+  if (previewPanel?.contains(targetElement)) {
+    return undefined;
+  }
+
+  const pageElement = targetElement.closest(
+    ".page[data-page-number]",
+  ) as HTMLElement | null;
+  if (!pageElement) {
+    return undefined;
+  }
+
+  const pageNumber = Number(pageElement.dataset.pageNumber);
+  if (!Number.isFinite(pageNumber)) {
+    return undefined;
+  }
+
+  const pageEntries = state.pageEntries.get(pageNumber - 1);
+  if (!pageEntries?.length) {
+    return undefined;
+  }
+
+  const pageRect = pageElement.getBoundingClientRect();
+  if (pageRect.width <= 0 || pageRect.height <= 0) {
+    return undefined;
+  }
+
+  const targetX = clamp((event.clientX - pageRect.left) / pageRect.width, 0, 1);
+  const targetY = clamp((event.clientY - pageRect.top) / pageRect.height, 0, 1);
+
+  return pageEntries.find((entry) => {
+    const bbox = entry.navigation?.targetBBoxNormalized;
+    if (!bbox) {
+      return false;
+    }
+
+    const padding = 0.012;
+    return (
+      targetX >= bbox[0] - padding &&
+      targetX <= bbox[2] + padding &&
+      targetY >= bbox[1] - padding &&
+      targetY <= bbox[3] + padding
+    );
+  });
+}
+
+async function openReaderFigurePreview(
+  reader: _ZoteroTypes.ReaderInstance,
+  state: FigurePreviewRenderState,
+  entry: FigureEntry,
+) {
+  const bbox = entry.navigation?.targetBBoxNormalized;
+  if (!bbox || bbox.length !== 4 || reader.type !== "pdf") {
+    return;
+  }
+
+  await ensureFigurePreviewSource(reader, state, entry);
+  closeReaderFigurePreview(state.doc);
+
+  const overlay = state.doc.createElement("div");
+  overlay.id = PREVIEW_OVERLAY_ID;
+  Object.assign(overlay.style, {
+    alignItems: "stretch",
+    background: "rgba(0, 0, 0, 0.55)",
+    display: "flex",
+    inset: "0",
+    justifyContent: "center",
+    padding: "12px",
+    position: "fixed",
+    zIndex: "2147483647",
+  });
+
+  const panel = state.doc.createElement("div");
+  panel.id = PREVIEW_PANEL_ID;
+  Object.assign(panel.style, {
+    boxSizing: "border-box",
+    color: "inherit",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "space-between",
+    maxHeight: "calc(100vh - 24px)",
+    maxWidth: "calc(100vw - 24px)",
+    pointerEvents: "none",
+    width: "100%",
+  });
+
+  const body = state.doc.createElement("div");
+  Object.assign(body.style, {
+    alignItems: "center",
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px",
+    justifyContent: "center",
+    maxHeight: "100%",
+    maxWidth: "100%",
+    overflow: "hidden",
+    pointerEvents: "auto",
+    width: "100%",
+  });
+
+  const status = state.doc.createElement("div");
+  status.textContent = getString("reader-figures-preview-loading");
+  Object.assign(status.style, {
+    color: "#fff",
+    fontSize: "12px",
+    lineHeight: "1.45",
+    padding: "24px 12px",
+  });
+
+  body.appendChild(status);
+  panel.appendChild(body);
+  overlay.appendChild(panel);
+
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) {
+      closeReaderFigurePreview(state.doc);
+    }
+  });
+
+  if (!state.doc.body) {
+    throw new Error("Reader document body is not available.");
+  }
+  state.doc.body.appendChild(overlay);
+
+  try {
+    const canvas = await renderFigurePreviewCanvas(state, entry);
+    const previewViewport = createPreviewViewport(state.doc, canvas);
+    const caption = state.doc.createElement("div");
+    caption.textContent = `${entry.label}  ${entry.caption}`;
+    Object.assign(caption.style, {
+      background: "rgba(0, 0, 0, 0.48)",
+      borderRadius: "6px",
+      color: "#fff",
+      fontSize: "12px",
+      lineHeight: "1.45",
+      maxWidth: "min(92vw, 1320px)",
+      overflowWrap: "anywhere",
+      padding: "8px 10px",
+      whiteSpace: "normal",
+    });
+
+    body.replaceChildren(previewViewport, caption);
+  } catch (error) {
+    ztoolkit.log("Failed to render figure preview", error);
+    status.textContent = `${getString("reader-figures-preview-error")} ${getErrorMessage(error)}`;
+  }
+}
+
+function closeReaderFigurePreview(doc: Document) {
+  doc.getElementById(PREVIEW_OVERLAY_ID)?.remove();
+}
+
+async function ensureFigurePreviewSource(
+  reader: _ZoteroTypes.ReaderInstance,
+  state: FigurePreviewRenderState,
+  entry: FigureEntry,
+) {
+  const pageNumber = entry.pageIndex + 1;
+  const existingCanvas = await waitForPreviewSourceCanvas(
+    state.context,
+    pageNumber,
+    2,
+    50,
+  );
+  if (existingCanvas) {
+    return;
+  }
+
+  await reader.navigate({ pageIndex: entry.pageIndex });
+  await scrollToFigureTarget(reader, entry);
+
+  const refreshedContext = await getPDFViewerContext(reader);
+  if (refreshedContext?.doc) {
+    state.context = refreshedContext;
+    state.doc = refreshedContext.doc;
+  }
+
+  const preparedCanvas = await waitForPreviewSourceCanvas(
+    state.context,
+    pageNumber,
+    40,
+    100,
+  );
+  if (!preparedCanvas) {
+    throw new Error("Figure preview data is not available.");
+  }
+}
+
+async function waitForPreviewSourceCanvas(
+  context: PDFViewerContext,
+  pageNumber: number,
+  attempts = 30,
+  delayMs = 100,
+) {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const pageElement = getRenderedPageElements(context).find((element) => {
+      return Number(element.dataset.pageNumber) === pageNumber;
+    });
+    const canvas = getPreviewSourceCanvas(pageElement);
+    if (canvas) {
+      return canvas;
+    }
+
+    await Zotero.Promise.delay(delayMs);
+  }
+
+  return undefined;
+}
+
+async function renderFigurePreviewCanvas(
+  state: FigurePreviewRenderState,
+  entry: FigureEntry,
+) {
+  const bbox = entry.navigation?.targetBBoxNormalized;
+  const sourceCanvas = await waitForPreviewSourceCanvas(
+    state.context,
+    entry.pageIndex + 1,
+  );
+  if (!bbox || !sourceCanvas) {
+    throw new Error("Figure preview data is not available.");
+  }
+
+  const paddedBBox = expandNormalizedBBox(bbox, 0.02);
+  const sourceX = Math.floor(paddedBBox[0] * sourceCanvas.width);
+  const sourceY = Math.floor(paddedBBox[1] * sourceCanvas.height);
+  const sourceWidth = Math.max(
+    1,
+    Math.ceil((paddedBBox[2] - paddedBBox[0]) * sourceCanvas.width),
+  );
+  const sourceHeight = Math.max(
+    1,
+    Math.ceil((paddedBBox[3] - paddedBBox[1]) * sourceCanvas.height),
+  );
+
+  const upscaleFactor = getPreviewUpscaleFactor(
+    state.doc,
+    sourceWidth,
+    sourceHeight,
+  );
+  const previewCanvas = state.doc.createElement("canvas");
+  previewCanvas.width = Math.max(1, Math.round(sourceWidth * upscaleFactor));
+  previewCanvas.height = Math.max(1, Math.round(sourceHeight * upscaleFactor));
+  Object.assign(previewCanvas.style, {
+    background: "#fff",
+    display: "block",
+    height: `${previewCanvas.height}px`,
+    width: `${previewCanvas.width}px`,
+  });
+
+  const previewContext = previewCanvas.getContext("2d", {
+    alpha: false,
+  }) as CanvasRenderingContext2D | null;
+  if (!previewContext) {
+    throw new Error("Failed to create preview bitmap.");
+  }
+
+  previewContext.imageSmoothingEnabled = true;
+  (
+    previewContext as CanvasRenderingContext2D & {
+      imageSmoothingQuality?: "low" | "medium" | "high";
+    }
+  ).imageSmoothingQuality = "high";
+  previewContext.drawImage(
+    sourceCanvas,
+    sourceX,
+    sourceY,
+    sourceWidth,
+    sourceHeight,
+    0,
+    0,
+    previewCanvas.width,
+    previewCanvas.height,
+  );
+
+  return previewCanvas;
+}
+
+function getPreviewSourceCanvas(pageElement: HTMLElement | undefined) {
+  if (!pageElement) {
+    return undefined;
+  }
+
+  const canvas = pageElement.querySelector(
+    "canvas",
+  ) as HTMLCanvasElement | null;
+  if (!canvas || canvas.width <= 0 || canvas.height <= 0) {
+    return undefined;
+  }
+
+  return canvas;
+}
+
+function createPreviewViewport(
+  doc: Document,
+  previewCanvas: HTMLCanvasElement,
+) {
+  const viewport = doc.createElement("div");
+  Object.assign(viewport.style, {
+    cursor: "grab",
+    flex: "1 1 auto",
+    maxHeight: "calc(100vh - 72px)",
+    maxWidth: "calc(100vw - 24px)",
+    overflow: "auto",
+    scrollbarWidth: "none",
+    width: "100%",
+  });
+
+  const stage = doc.createElement("div");
+  Object.assign(stage.style, {
+    alignItems: "center",
+    display: "flex",
+    justifyContent: "center",
+    minHeight: "100%",
+    minWidth: "100%",
+    padding: "8px",
+  });
+
+  let zoomScale = getInitialPreviewZoom(doc, previewCanvas);
+  applyPreviewZoom(previewCanvas, zoomScale);
+  const syncStageLayout = () => {
+    updatePreviewStageLayout(viewport, stage, previewCanvas);
+  };
+  let dragState:
+    | {
+        pointerId: number;
+        originX: number;
+        originY: number;
+        scrollLeft: number;
+        scrollTop: number;
+      }
+    | undefined;
+
+  viewport.addEventListener(
+    "wheel",
+    (event: WheelEvent) => {
+      event.preventDefault();
+
+      const rect = viewport.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      const anchorX = (viewport.scrollLeft + pointerX) / zoomScale;
+      const anchorY = (viewport.scrollTop + pointerY) / zoomScale;
+      const nextZoomScale = clamp(
+        zoomScale * (event.deltaY < 0 ? 1.12 : 1 / 1.12),
+        0.6,
+        5,
+      );
+      if (Math.abs(nextZoomScale - zoomScale) < 0.001) {
+        return;
+      }
+
+      zoomScale = nextZoomScale;
+      applyPreviewZoom(previewCanvas, zoomScale);
+      syncStageLayout();
+      viewport.scrollLeft = Math.max(0, anchorX * zoomScale - pointerX);
+      viewport.scrollTop = Math.max(0, anchorY * zoomScale - pointerY);
+    },
+    { passive: false },
+  );
+  viewport.addEventListener("pointerdown", (event: PointerEvent) => {
+    if (event.button !== 0) {
+      return;
+    }
+
+    dragState = {
+      pointerId: event.pointerId,
+      originX: event.clientX,
+      originY: event.clientY,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+    };
+    viewport.style.cursor = "grabbing";
+    viewport.setPointerCapture(event.pointerId);
+  });
+  viewport.addEventListener("pointermove", (event: PointerEvent) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const deltaX = event.clientX - dragState.originX;
+    const deltaY = event.clientY - dragState.originY;
+    viewport.scrollLeft = dragState.scrollLeft - deltaX;
+    viewport.scrollTop = dragState.scrollTop - deltaY;
+  });
+  const finishDrag = (event: PointerEvent) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+
+    dragState = undefined;
+    viewport.style.cursor = "grab";
+    if (viewport.hasPointerCapture(event.pointerId)) {
+      viewport.releasePointerCapture(event.pointerId);
+    }
+  };
+  viewport.addEventListener("pointerup", finishDrag);
+  viewport.addEventListener("pointercancel", finishDrag);
+
+  stage.appendChild(previewCanvas);
+  viewport.appendChild(stage);
+  doc.defaultView?.requestAnimationFrame(syncStageLayout);
+  return viewport;
+}
+
+function applyPreviewZoom(previewCanvas: HTMLCanvasElement, zoomScale: number) {
+  previewCanvas.style.width = `${Math.max(1, Math.round(previewCanvas.width * zoomScale))}px`;
+  previewCanvas.style.height = `${Math.max(1, Math.round(previewCanvas.height * zoomScale))}px`;
+}
+
+function getInitialPreviewZoom(
+  doc: Document,
+  previewCanvas: HTMLCanvasElement,
+) {
+  const win = doc.defaultView;
+  const maxDisplayWidth = Math.max(640, (win?.innerWidth ?? 1280) * 0.86);
+  const maxDisplayHeight = Math.max(520, (win?.innerHeight ?? 900) - 230);
+  const widthScale = maxDisplayWidth / Math.max(previewCanvas.width, 1);
+  const heightScale = maxDisplayHeight / Math.max(previewCanvas.height, 1);
+  return clamp(Math.min(widthScale, heightScale, 1), 0.75, 1);
+}
+
+function updatePreviewStageLayout(
+  viewport: HTMLDivElement,
+  stage: HTMLDivElement,
+  previewCanvas: HTMLCanvasElement,
+) {
+  const padding = 16;
+  const renderedWidth = parseCanvasDisplaySize(
+    previewCanvas.style.width,
+    previewCanvas.width,
+  );
+  const renderedHeight = parseCanvasDisplaySize(
+    previewCanvas.style.height,
+    previewCanvas.height,
+  );
+  const viewportWidth = Math.max(viewport.clientWidth, 1);
+  const viewportHeight = Math.max(viewport.clientHeight, 1);
+  const contentWidth = renderedWidth + padding;
+  const contentHeight = renderedHeight + padding;
+
+  stage.style.width = `${Math.max(viewportWidth, contentWidth)}px`;
+  stage.style.height = `${Math.max(viewportHeight, contentHeight)}px`;
+  stage.style.justifyContent =
+    contentWidth <= viewportWidth ? "center" : "flex-start";
+  stage.style.alignItems =
+    contentHeight <= viewportHeight ? "center" : "flex-start";
+}
+
+function parseCanvasDisplaySize(value: string, fallback: number) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getPreviewUpscaleFactor(
+  doc: Document,
+  sourceWidth: number,
+  sourceHeight: number,
+) {
+  const win = doc.defaultView;
+  const maxDisplayWidth = Math.max(640, (win?.innerWidth ?? 1280) * 0.82);
+  const maxDisplayHeight = Math.max(520, (win?.innerHeight ?? 900) - 220);
+  const widthScale = maxDisplayWidth / Math.max(sourceWidth, 1);
+  const heightScale = maxDisplayHeight / Math.max(sourceHeight, 1);
+  const preferredScale = Math.min(widthScale, heightScale);
+
+  return clamp(preferredScale, 1.4, 3.2);
+}
+
+function expandNormalizedBBox(
+  bbox: [number, number, number, number],
+  padding: number,
+): [number, number, number, number] {
+  return [
+    clamp(bbox[0] - padding, 0, 1),
+    clamp(bbox[1] - padding, 0, 1),
+    clamp(bbox[2] + padding, 0, 1),
+    clamp(bbox[3] + padding, 0, 1),
+  ];
 }
