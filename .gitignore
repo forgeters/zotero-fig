@@ -6,6 +6,9 @@ node_modules
 pnpm-lock.yaml
 yarn.lock
 
+# Python
+__pycache__
+
 # TSC
 tsconfig.tsbuildinfo
 
@@ -14,3 +17,4 @@ tsconfig.tsbuildinfo
 .scaffold
 build
 logs
+tmp

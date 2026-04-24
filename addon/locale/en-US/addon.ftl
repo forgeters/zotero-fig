@@ -4,3 +4,6 @@ reader-figures-loading = Scanning PDF captions...
 reader-figures-empty = No figure or table captions detected.
 reader-figures-error = Failed to scan this PDF. Try reopening the reader.
 reader-figures-sequence-warning = Possible missing captions: {$labels}
+reader-figures-helper-partial = Precise navigation is enabled for {$matched}/{$total} figures. The rest are using caption fallback.
+reader-figures-helper-no-python = No usable Python environment was found. Using caption-based navigation.
+reader-figures-helper-fallback = Precise navigation is temporarily unavailable. Using caption-based navigation.

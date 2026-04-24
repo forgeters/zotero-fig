@@ -4,3 +4,6 @@ reader-figures-loading = 正在扫描 PDF 图表标题...
 reader-figures-empty = 未识别到图表标题。
 reader-figures-error = 扫描 PDF 失败，请尝试重新打开阅读器。
 reader-figures-sequence-warning = 可能漏检：{$labels}
+reader-figures-helper-partial = 已启用精确定位，{$matched}/{$total} 个 Figure 使用 bbox，其余回退标题定位。
+reader-figures-helper-no-python = 未检测到可用的 Python 环境，当前使用标题定位。
+reader-figures-helper-fallback = 精确定位暂时不可用，当前使用标题定位。

@@ -1,20 +1,11 @@
 import { getLocaleID, getString } from "../utils/locale";
-
-type FigureEntryType = "figure" | "table";
-
-interface FigureEntry {
-  id: string;
-  type: FigureEntryType;
-  label: string;
-  caption: string;
-  pageIndex: number;
-  targetTopRatio?: number;
-}
-
-interface FigureScanResult {
-  entries: FigureEntry[];
-  warnings: string[];
-}
+import { scanPDFWithHelper } from "./pdfHelper";
+import type {
+  FigureEntry,
+  FigureEntryType,
+  FigureScanResult,
+  HelperDiagnostics,
+} from "./figureTypes";
 
 interface ParsedCaptionLabel {
   key: string;
@@ -86,7 +77,7 @@ export function registerReaderFigurePanel() {
         icon: "chrome://zotero/skin/16/universal/book.svg",
         l10nID: getLocaleID("reader-figures-refresh-button-tooltip"),
         onClick: (props) => {
-          void scanAndRender(props);
+          void scanAndRenderInternal(props, true);
         },
       },
     ],
@@ -105,12 +96,20 @@ export function unregisterReaderFigurePanel() {
 }
 
 async function scanAndRender(props: FigurePanelRenderProps) {
+  await scanAndRenderInternal(props, false);
+}
+
+async function scanAndRenderInternal(
+  props: FigurePanelRenderProps,
+  forceRefresh: boolean,
+) {
   renderStatus(props.body, getString("reader-figures-loading"));
   props.setSectionSummary("...");
 
   try {
     const result = await scanPDFCaptions(
       props.item,
+      forceRefresh,
       (pageNumber, pageCount) => {
         if (!shouldRenderScanProgress(pageNumber, pageCount)) {
           return;
@@ -140,6 +139,21 @@ function shouldRenderScanProgress(pageNumber: number, pageCount: number) {
 
 async function scanPDFCaptions(
   item: Zotero.Item,
+  forceRefresh: boolean,
+  onProgress: (pageNumber: number, pageCount: number) => void,
+): Promise<FigureScanResult> {
+  const reader = await getReaderForItem(item);
+  const pdfItem = getPDFItemForReader(item, reader);
+  const [legacyResult, helperResult] = await Promise.all([
+    scanPDFCaptionsLegacy(item, onProgress),
+    scanPDFWithHelper(pdfItem, { forceRefresh }),
+  ]);
+
+  return mergeFigureScanResults(legacyResult, helperResult);
+}
+
+async function scanPDFCaptionsLegacy(
+  item: Zotero.Item,
   onProgress: (pageNumber: number, pageCount: number) => void,
 ): Promise<FigureScanResult> {
   const reader = await getReaderForItem(item);
@@ -168,6 +182,84 @@ async function scanPDFCaptions(
   }
 
   return refineCaptionEntries(entries);
+}
+
+function mergeFigureScanResults(
+  legacyResult: FigureScanResult,
+  helperResult: FigureScanResult,
+): FigureScanResult {
+  if (helperResult.entries.length === 0) {
+    return {
+      ...legacyResult,
+      helperDiagnostics: helperResult.helperDiagnostics,
+    };
+  }
+
+  const helperEntriesByKey = new Map(
+    helperResult.entries.map((entry) => [getFigureMergeKey(entry), entry]),
+  );
+  const mergedEntries = legacyResult.entries.map((entry) => {
+    if (entry.type !== "figure") {
+      return entry;
+    }
+
+    const helperEntry = helperEntriesByKey.get(getFigureMergeKey(entry));
+    if (!helperEntry?.navigation) {
+      return entry;
+    }
+
+    return {
+      ...entry,
+      pageIndex: helperEntry.pageIndex,
+      navigation: helperEntry.navigation,
+    };
+  });
+
+  for (const helperEntry of helperResult.entries) {
+    if (helperEntry.type !== "figure") {
+      continue;
+    }
+
+    const key = getFigureMergeKey(helperEntry);
+    const hasLegacyEntry = mergedEntries.some(
+      (entry) => getFigureMergeKey(entry) === key,
+    );
+    if (!hasLegacyEntry) {
+      mergedEntries.push(helperEntry);
+    }
+  }
+
+  mergedEntries.sort(compareEntries);
+  return {
+    entries: mergedEntries,
+    warnings: Array.from(
+      new Set([
+        ...(legacyResult.warnings || []),
+        ...(helperResult.warnings || []),
+      ]),
+    ),
+    helperDiagnostics: helperResult.helperDiagnostics,
+  };
+}
+
+function getFigureMergeKey(entry: FigureEntry) {
+  return `${entry.type}:${getCaptionEntryKey(entry)}`;
+}
+
+function getPDFItemForReader(
+  item: Zotero.Item,
+  reader: _ZoteroTypes.ReaderInstance | undefined,
+) {
+  if (item.isPDFAttachment()) {
+    return item;
+  }
+
+  const readerItem = reader?._item;
+  if (readerItem?.isPDFAttachment()) {
+    return readerItem;
+  }
+
+  return item;
 }
 
 function getPDFPageCount(context: PDFViewerContext) {
@@ -982,13 +1074,28 @@ function renderFigureList(
   result: FigureScanResult,
 ) {
   body.replaceChildren();
+  const doc = body.ownerDocument as Document;
 
   if (result.entries.length === 0) {
-    renderStatus(body, getString("reader-figures-empty"));
+    if (shouldShowHelperNotice(result.helperDiagnostics)) {
+      body.appendChild(createHelperNoticeBlock(doc, result.helperDiagnostics!));
+    }
+
+    const empty = doc.createElement("div");
+    empty.textContent = getString("reader-figures-empty");
+    Object.assign(empty.style, {
+      color: "var(--fill-secondary)",
+      fontSize: "12px",
+      lineHeight: "1.45",
+      padding: "10px 0 12px",
+    });
+    body.appendChild(empty);
     return;
   }
 
-  const doc = body.ownerDocument as Document;
+  if (shouldShowHelperNotice(result.helperDiagnostics)) {
+    body.appendChild(createHelperNoticeBlock(doc, result.helperDiagnostics!));
+  }
   if (result.warnings.length > 0) {
     body.appendChild(createWarningBlock(doc, result.warnings));
   }
@@ -1028,6 +1135,61 @@ function createWarningBlock(doc: Document, warnings: string[]) {
   });
 
   return warning;
+}
+
+function shouldShowHelperNotice(diagnostics?: HelperDiagnostics) {
+  if (!diagnostics) {
+    return false;
+  }
+
+  if (diagnostics.status !== "succeeded") {
+    return true;
+  }
+
+  const matched = diagnostics.matchedFigureCount ?? 0;
+  const total = diagnostics.helperFigureCount ?? 0;
+  return total === 0 || matched < total;
+}
+
+function createHelperNoticeBlock(
+  doc: Document,
+  diagnostics: HelperDiagnostics,
+) {
+  const block = doc.createElement("div");
+  Object.assign(block.style, {
+    background: "var(--material-background)",
+    border: "1px solid var(--fill-quinary)",
+    borderRadius: "6px",
+    color: "var(--fill-secondary)",
+    fontSize: "12px",
+    lineHeight: "1.45",
+    margin: "10px 0 0",
+    padding: "8px",
+  });
+  block.textContent = getHelperNoticeText(diagnostics);
+
+  return block;
+}
+
+function getHelperNoticeText(diagnostics: HelperDiagnostics) {
+  if (
+    diagnostics.status === "succeeded" &&
+    typeof diagnostics.matchedFigureCount === "number" &&
+    typeof diagnostics.helperFigureCount === "number"
+  ) {
+    return getString("reader-figures-helper-partial", {
+      args: {
+        matched: String(diagnostics.matchedFigureCount),
+        total: String(diagnostics.helperFigureCount),
+      },
+    });
+  }
+
+  if (diagnostics.status === "no_python") {
+    return getString("reader-figures-helper-no-python");
+  }
+
+  return getString("reader-figures-helper-fallback");
 }
 
 function renderStatus(body: HTMLDivElement, message: string) {
@@ -1118,8 +1280,16 @@ function createFigureCard(
     width: "fit-content",
   });
 
+  const badges = doc.createElement("div");
+  Object.assign(badges.style, {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "6px",
+  });
+  badges.appendChild(badge);
+
   heading.append(label, page);
-  card.append(heading, caption, badge);
+  card.append(heading, caption, badges);
   card.addEventListener("click", () => {
     void navigateToFigure(entry, item);
   });
@@ -1181,6 +1351,12 @@ async function scrollToFigureTarget(
     return;
   }
 
+  const helperTargetRatio = getHelperTargetTopRatio(entry);
+  if (typeof helperTargetRatio === "number") {
+    scrollToPageRatio(scrollContainer, pageElement, helperTargetRatio, entry);
+    return;
+  }
+
   const targetTopRatio =
     (await waitForCaptionTargetTopRatio(pageElement, entry)) ??
     entry.targetTopRatio;
@@ -1188,17 +1364,53 @@ async function scrollToFigureTarget(
     return;
   }
 
+  scrollToPageRatio(scrollContainer, pageElement, targetTopRatio, entry);
+}
+
+function scrollToPageRatio(
+  scrollContainer: HTMLElement,
+  pageElement: HTMLElement,
+  targetTopRatio: number,
+  entry: FigureEntry,
+) {
   const containerRect = scrollContainer.getBoundingClientRect();
   const pageRect = pageElement.getBoundingClientRect();
   const targetTop =
     scrollContainer.scrollTop +
     (pageRect.top - containerRect.top) +
     pageRect.height * targetTopRatio;
-  const anchorOffset =
-    entry.type === "figure"
-      ? scrollContainer.clientHeight * 0.82
-      : scrollContainer.clientHeight * 0.12;
+  const anchorOffset = getAnchorOffset(scrollContainer, entry);
   scrollContainer.scrollTop = Math.max(0, targetTop - anchorOffset);
+}
+
+function getHelperTargetTopRatio(entry: FigureEntry) {
+  const bbox = entry.navigation?.targetBBoxNormalized;
+  if (!bbox || bbox.length !== 4) {
+    return undefined;
+  }
+
+  if (entry.navigation?.anchor === "center") {
+    return clamp((bbox[1] + bbox[3]) / 2, 0, 1);
+  }
+
+  return clamp(bbox[1], 0, 1);
+}
+
+function getAnchorOffset(scrollContainer: HTMLElement, entry: FigureEntry) {
+  switch (entry.navigation?.anchor) {
+    case "center":
+      return scrollContainer.clientHeight * 0.5;
+
+    case "top":
+      return scrollContainer.clientHeight * 0.12;
+
+    case "bottom":
+      return scrollContainer.clientHeight * 0.82;
+  }
+
+  return entry.type === "figure"
+    ? scrollContainer.clientHeight * 0.82
+    : scrollContainer.clientHeight * 0.12;
 }
 
 async function waitForRenderedPageElement(
