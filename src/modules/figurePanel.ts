@@ -60,6 +60,8 @@ const CJK_NUMBER_PATTERN = `[0-9０-９${CJK_NUMERAL_CHARS}]+`;
 const PREVIEW_OVERLAY_ID = "zoterofig-figure-preview-overlay";
 const PREVIEW_PANEL_ID = "zoterofig-figure-preview-panel";
 const PREVIEW_CURSOR = "zoom-in";
+const PANEL_ICON_URI = "chrome://global/skin/icons/search-glass.svg";
+const REFRESH_ICON_URI = "chrome://global/skin/icons/reload.svg";
 
 let registered = false;
 const readerPreviewStates = new WeakMap<
@@ -78,11 +80,11 @@ export function registerReaderFigurePanel() {
     pluginID: addon.data.config.addonID,
     header: {
       l10nID: getLocaleID("reader-figures-head-text"),
-      icon: "chrome://zotero/skin/16/universal/book.svg",
+      icon: PANEL_ICON_URI,
     },
     sidenav: {
       l10nID: getLocaleID("reader-figures-sidenav-tooltip"),
-      icon: "chrome://zotero/skin/20/universal/save.svg",
+      icon: PANEL_ICON_URI,
     },
     onItemChange: ({ tabType, setEnabled }) => {
       setEnabled(tabType === "reader");
@@ -97,7 +99,7 @@ export function registerReaderFigurePanel() {
     sectionButtons: [
       {
         type: "refresh",
-        icon: "chrome://zotero/skin/16/universal/book.svg",
+        icon: REFRESH_ICON_URI,
         l10nID: getLocaleID("reader-figures-refresh-button-tooltip"),
         onClick: (props) => {
           void scanAndRenderInternal(props, true);
