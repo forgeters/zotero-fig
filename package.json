@@ -1,7 +1,7 @@
 {
   "name": "zotero-fig",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Identify figures and tables in Zotero PDF reader and provide navigation and preview UI.",
   "config": {
     "addonName": "Zotero Fig",

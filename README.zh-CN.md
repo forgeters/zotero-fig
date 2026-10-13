@@ -6,7 +6,7 @@
   <img src="addon/content/icons/icon.png" alt="Zotero Fig 图标" width="96" height="96">
 </p>
 
-Zotero Fig 是一个适用于 Zotero 7-9 的插件，用于识别 PDF 附件中的图表，
+Zotero Fig 是一个适用于 Zotero 7-10 的插件，用于识别 PDF 附件中的图表，
 在阅读器侧边栏统一展示，支持精确跳转，并提供图表放大预览。
 
 本项目基于
@@ -52,7 +52,7 @@ Zotero Fig 是一个适用于 Zotero 7-9 的插件，用于识别 PDF 附件中�
 
 ## 环境要求
 
-- Zotero `7.x` / `8.x` / `9.x`
+- Zotero `7.x` / `8.x` / `9.x` / `10.0.x`
 - Python `3.x`
 - Zotero Fig 能找到的 Python 环境中已安装 `PyMuPDF`
 

@@ -6,7 +6,7 @@
   <img src="addon/content/icons/icon.png" alt="Zotero Fig icon" width="96" height="96">
 </p>
 
-Zotero Fig is a Zotero 7-9 plugin for detecting figures and tables in PDF
+Zotero Fig is a Zotero 7-10 plugin for detecting figures and tables in PDF
 attachments, showing them in the reader side pane, supporting precise
 navigation, and providing enlarged figure preview.
 
@@ -52,7 +52,7 @@ This project is based on
 
 ## Requirements
 
-- Zotero `7.x` / `8.x` / `9.x`
+- Zotero `7.x` / `8.x` / `9.x` / `10.0.x`
 - Python `3.x`
 - PyMuPDF installed in the Python environment that Zotero Fig can find
 

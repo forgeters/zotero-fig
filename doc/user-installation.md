@@ -2,7 +2,7 @@
 
 ## 适用环境
 
-- Zotero `7.x` / `8.x` / `9.x`
+- Zotero `7.x` / `8.x` / `9.x` / `10.0.x`
 - Windows / macOS / Linux
 - 本机可用的 Python `3.x`
 
