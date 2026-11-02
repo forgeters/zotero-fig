@@ -1,5 +1,6 @@
 import { getLocaleID, getString } from "../utils/locale";
 import { scanPDFWithHelper } from "./pdfHelper";
+import { getScanCacheEntry, readScanCache, writeScanCache } from "./scanCache";
 import type {
   FigureEntry,
   FigureEntryType,
@@ -37,6 +38,7 @@ interface ReaderFigurePreviewState {
   doc: Document;
   scrollContainer: HTMLElement;
   pageEntries: Map<number, FigureEntry[]>;
+  figureHovered: boolean;
   clickListener: (event: MouseEvent) => void;
   mouseMoveListener: (event: MouseEvent) => void;
   keydownListener: (event: KeyboardEvent) => void;
@@ -60,10 +62,13 @@ const CJK_NUMBER_PATTERN = `[0-9０-９${CJK_NUMERAL_CHARS}]+`;
 const PREVIEW_OVERLAY_ID = "zoterofig-figure-preview-overlay";
 const PREVIEW_PANEL_ID = "zoterofig-figure-preview-panel";
 const PREVIEW_CURSOR = "zoom-in";
+const FIGURE_CURSOR_CLASS = "zoterofig-figure-hover";
+const CURSOR_STYLE_ID = "zoterofig-cursor-style";
 const PANEL_ICON_URI = "chrome://global/skin/icons/search-glass.svg";
 const REFRESH_ICON_URI = "chrome://global/skin/icons/reload.svg";
 
 let registered = false;
+const pendingScans = new Map<string, Promise<FigureScanResult>>();
 const readerPreviewStates = new WeakMap<
   _ZoteroTypes.ReaderInstance,
   ReaderFigurePreviewState
@@ -169,14 +174,74 @@ async function scanPDFCaptions(
   forceRefresh: boolean,
   onProgress: (pageNumber: number, pageCount: number) => void,
 ): Promise<FigureScanResult> {
-  const reader = await getReaderForItem(item);
-  const pdfItem = getPDFItemForReader(item, reader);
+  const pdfItem = await resolveScanPDFItem(item);
+  const cacheEntry = pdfItem ? await getScanCacheEntry(pdfItem) : undefined;
+
+  if (cacheEntry && !forceRefresh) {
+    const cachedResult = await readScanCache(cacheEntry);
+    if (cachedResult) {
+      ztoolkit.log("Reusing cached figure scan", {
+        itemID: pdfItem?.id,
+        entries: cachedResult.entries.length,
+      });
+      return cachedResult;
+    }
+
+    const pendingScan = pendingScans.get(cacheEntry.key);
+    if (pendingScan) {
+      return pendingScan;
+    }
+  }
+
+  const scanPromise = runScan(
+    item,
+    pdfItem,
+    forceRefresh,
+    onProgress,
+    cacheEntry,
+  );
+
+  if (cacheEntry && !forceRefresh) {
+    pendingScans.set(cacheEntry.key, scanPromise);
+    void scanPromise
+      .finally(() => {
+        pendingScans.delete(cacheEntry.key);
+      })
+      .catch(() => {
+        // The panel renders the failure; nothing to do here.
+      });
+  }
+
+  return scanPromise;
+}
+
+async function runScan(
+  item: Zotero.Item,
+  pdfItem: Zotero.Item | undefined,
+  forceRefresh: boolean,
+  onProgress: (pageNumber: number, pageCount: number) => void,
+  cacheEntry: Awaited<ReturnType<typeof getScanCacheEntry>>,
+): Promise<FigureScanResult> {
   const [legacyResult, helperResult] = await Promise.all([
     scanPDFCaptionsLegacy(item, onProgress),
-    scanPDFWithHelper(pdfItem, { forceRefresh }),
+    scanPDFWithHelper(pdfItem ?? item, { forceRefresh }),
   ]);
+  const mergedResult = mergeFigureScanResults(legacyResult, helperResult);
+  if (cacheEntry) {
+    void writeScanCache(cacheEntry, mergedResult);
+  }
 
-  return mergeFigureScanResults(legacyResult, helperResult);
+  return mergedResult;
+}
+
+async function resolveScanPDFItem(item: Zotero.Item) {
+  if (item.isPDFAttachment()) {
+    return item;
+  }
+
+  const reader = await getReaderForItem(item);
+  const readerItem = reader?._item;
+  return readerItem?.isPDFAttachment() ? readerItem : undefined;
 }
 
 async function updateReaderFigurePreview(
@@ -207,6 +272,7 @@ async function updateReaderFigurePreview(
     existingState.doc === doc &&
     existingState.scrollContainer === scrollContainer
   ) {
+    ensureReaderCursorStyles(doc);
     existingState.context = context;
     existingState.pageEntries = pageEntries;
     return;
@@ -216,11 +282,14 @@ async function updateReaderFigurePreview(
     teardownReaderFigurePreview(existingState);
   }
 
+  ensureReaderCursorStyles(doc);
+
   const state: ReaderFigurePreviewState = {
     context,
     doc,
     scrollContainer,
     pageEntries,
+    figureHovered: false,
     clickListener: (event) => {
       void handleReaderFigureClick(reader, state, event);
     },
@@ -335,22 +404,6 @@ function mergeFigureScanResults(
 
 function getFigureMergeKey(entry: FigureEntry) {
   return `${entry.type}:${getCaptionEntryKey(entry)}`;
-}
-
-function getPDFItemForReader(
-  item: Zotero.Item,
-  reader: _ZoteroTypes.ReaderInstance | undefined,
-) {
-  if (item.isPDFAttachment()) {
-    return item;
-  }
-
-  const readerItem = reader?._item;
-  if (readerItem?.isPDFAttachment()) {
-    return readerItem;
-  }
-
-  return item;
 }
 
 function groupPreviewEntriesByPage(entries: FigureEntry[]) {
@@ -1672,7 +1725,8 @@ function teardownReaderFigurePreview(state: ReaderFigurePreviewState) {
     state.mouseMoveListener,
   );
   state.doc.defaultView?.removeEventListener("keydown", state.keydownListener);
-  state.scrollContainer.style.cursor = "";
+  state.scrollContainer.classList.remove(FIGURE_CURSOR_CLASS);
+  state.figureHovered = false;
   closeReaderFigurePreview(state.doc);
   activeReaderPreviewStates.delete(state);
 }
@@ -1717,8 +1771,37 @@ function updateReaderFigureHover(
     return;
   }
 
-  const match = findFigureEntryAtEventTarget(state, event);
-  state.scrollContainer.style.cursor = match ? PREVIEW_CURSOR : "";
+  const isOverFigure = Boolean(findFigureEntryAtEventTarget(state, event));
+  if (isOverFigure === state.figureHovered) {
+    return;
+  }
+
+  state.figureHovered = isOverFigure;
+  state.scrollContainer.classList.toggle(FIGURE_CURSOR_CLASS, isOverFigure);
+}
+
+/**
+ * The reader writes `viewerContainer.style.cursor` from its own
+ * requestAnimationFrame-throttled pointermove handler, and a plain style
+ * assignment replaces the declaration together with any inline `!important`
+ * priority. The cursor therefore has to live in a style sheet rule, which
+ * keeps its priority and is never touched by the reader.
+ */
+function ensureReaderCursorStyles(doc: Document) {
+  if (doc.getElementById(CURSOR_STYLE_ID)) {
+    return;
+  }
+
+  const style = doc.createElement("style");
+  style.id = CURSOR_STYLE_ID;
+  style.textContent =
+    "." +
+    FIGURE_CURSOR_CLASS +
+    " { cursor: " +
+    PREVIEW_CURSOR +
+    " !important; }";
+  const styleHost = doc.head ?? doc.documentElement;
+  styleHost?.appendChild(style);
 }
 
 function findFigureEntryAtEventTarget(
